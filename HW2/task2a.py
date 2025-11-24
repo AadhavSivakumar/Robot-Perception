@@ -1,238 +1,158 @@
 import open3d as o3d
 import numpy as np
 import copy
-from typing import Tuple
-from tqdm import tqdm
+import sys
 
-# Try to import CuPy for GPU acceleration
-CUDA_AVAILABLE = False
+# Try to import CUDA support
 try:
-    import cupy as cp
+    from numba import cuda
+    import math
 
-    # Test if CUDA actually works
-    try:
-        test_array = cp.array([1, 2, 3])
-        _ = test_array + 1
-        CUDA_AVAILABLE = True
-        print("✓ CUDA acceleration available and working")
-    except Exception as e:
-        print(f"✗ CUDA libraries found but not functional: {type(e).__name__}")
-        print("  Falling back to optimized CPU implementation")
-        CUDA_AVAILABLE = False
-except ImportError:
-    print("✗ CuPy not installed, using optimized CPU implementation")
-    print("  To enable GPU: pip install cupy-cuda12x (requires NVIDIA GPU + CUDA toolkit)")
+    CUDA_AVAILABLE = cuda.is_available()
+    if CUDA_AVAILABLE:
+        print("CUDA is available!")
+        print(f"CUDA Device: {cuda.get_current_device().name.decode()}")
+    else:
+        print("CUDA not available, will use CPU fallback")
+except Exception as e:
+    print(f"Error initializing CUDA: {e}")
+    print("Will use CPU fallback")
+    CUDA_AVAILABLE = False
+
+if CUDA_AVAILABLE:
+    # CUDA kernel for finding nearest neighbors
+    @cuda.jit
+    def find_nearest_neighbors_kernel(source_points, target_points, indices, distances):
+        """
+        CUDA kernel to find nearest neighbor for each source point in target point cloud
+
+        Args:
+            source_points: Nx3 array of source points
+            target_points: Mx3 array of target points
+            indices: Output array of size N containing nearest neighbor indices
+            distances: Output array of size N containing nearest neighbor distances
+        """
+        idx = cuda.grid(1)
+
+        if idx < source_points.shape[0]:
+            min_dist = 1e10
+            min_idx = -1
+
+            # Find nearest neighbor in target
+            for j in range(target_points.shape[0]):
+                dx = source_points[idx, 0] - target_points[j, 0]
+                dy = source_points[idx, 1] - target_points[j, 1]
+                dz = source_points[idx, 2] - target_points[j, 2]
+                dist = dx * dx + dy * dy + dz * dz
+
+                if dist < min_dist:
+                    min_dist = dist
+                    min_idx = j
+
+            indices[idx] = min_idx
+            distances[idx] = math.sqrt(min_dist)
 
 
-def find_closest_points_gpu(source_points: np.ndarray,
-                            target_points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    @cuda.jit
+    def transform_points_kernel(points, transformation, output):
+        """
+        CUDA kernel to apply 4x4 transformation matrix to points
+
+        Args:
+            points: Nx3 array of points
+            transformation: 4x4 transformation matrix
+            output: Nx3 output array of transformed points
+        """
+        idx = cuda.grid(1)
+
+        if idx < points.shape[0]:
+            x = points[idx, 0]
+            y = points[idx, 1]
+            z = points[idx, 2]
+
+            # Apply transformation: [R|t] * [x,y,z,1]^T
+            output[idx, 0] = transformation[0, 0] * x + transformation[0, 1] * y + transformation[0, 2] * z + \
+                             transformation[0, 3]
+            output[idx, 1] = transformation[1, 0] * x + transformation[1, 1] * y + transformation[1, 2] * z + \
+                             transformation[1, 3]
+            output[idx, 2] = transformation[2, 0] * x + transformation[2, 1] * y + transformation[2, 2] * z + \
+                             transformation[2, 3]
+
+
+def find_nearest_neighbors_cpu(source_points, target_points):
     """
-    GPU-accelerated closest point finding using CuPy.
-
-    Parameters:
-    -----------
-    source_points : np.ndarray
-        Source point cloud points (N x 3)
-    target_points : np.ndarray
-        Target point cloud points (M x 3)
-
-    Returns:
-    --------
-    distances : np.ndarray
-        Distance to closest point for each source point
-    indices : np.ndarray
-        Index of closest target point for each source point
-    """
-    try:
-        # Transfer data to GPU
-        print(f"\n      → Transferring {len(source_points):,} points to GPU...", end='', flush=True)
-        source_gpu = cp.asarray(source_points)
-        target_gpu = cp.asarray(target_points)
-        print(" ✓", flush=True)
-
-        n_source = source_gpu.shape[0]
-        n_target = target_gpu.shape[0]
-
-        # Process in batches to avoid GPU memory issues
-        batch_size = 1000
-        num_batches = (n_source + batch_size - 1) // batch_size
-        distances = []
-        indices = []
-
-        print(f"      → Processing {num_batches} batches on GPU...", flush=True)
-
-        import time
-        for batch_idx, i in enumerate(range(0, n_source, batch_size)):
-            if batch_idx % 10 == 0:  # Print every 10 batches
-                print(f"         Batch {batch_idx + 1}/{num_batches} ({100 * (batch_idx + 1) / num_batches:.1f}%)",
-                      flush=True)
-
-            batch_end = min(i + batch_size, n_source)
-            batch_source = source_gpu[i:batch_end]
-
-            # Compute all pairwise distances for this batch
-            diff = batch_source[:, cp.newaxis, :] - target_gpu[cp.newaxis, :, :]
-            batch_distances = cp.linalg.norm(diff, axis=2)
-
-            # Find minimum distance and index for each point in batch
-            batch_min_distances = cp.min(batch_distances, axis=1)
-            batch_min_indices = cp.argmin(batch_distances, axis=1)
-
-            distances.append(batch_min_distances)
-            indices.append(batch_min_indices)
-
-        print(f"      → Transferring results back to CPU...", end='', flush=True)
-        # Concatenate results and transfer back to CPU
-        distances = cp.concatenate(distances)
-        indices = cp.concatenate(indices)
-
-        result = cp.asnumpy(distances), cp.asnumpy(indices)
-        print(" ✓", flush=True)
-
-        return result
-
-    except Exception as e:
-        # If GPU operations fail, fall back to CPU
-        print(f"\n⚠ GPU operation failed ({type(e).__name__}), falling back to CPU")
-        return find_closest_points_cpu(source_points, target_points)
-
-
-def find_closest_points_cpu(source_points: np.ndarray,
-                            target_points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Optimized CPU-based closest point finding using vectorized operations.
-    Uses chunking to balance speed and memory usage.
-
-    Parameters:
-    -----------
-    source_points : np.ndarray
-        Source point cloud points (N x 3)
-    target_points : np.ndarray
-        Target point cloud points (M x 3)
-
-    Returns:
-    --------
-    distances : np.ndarray
-        Distance to closest point for each source point
-    indices : np.ndarray
-        Index of closest target point for each source point
+    CPU fallback for finding nearest neighbors
     """
     n_source = source_points.shape[0]
-    n_target = target_points.shape[0]
-
-    # Adjust batch size based on memory constraints
-    # For large point clouds, use smaller batches
-    if n_source > 50000 or n_target > 50000:
-        batch_size = 200
-    elif n_source > 10000 or n_target > 10000:
-        batch_size = 500
-    else:
-        batch_size = 1000
-
-    distances = np.zeros(n_source, dtype=np.float32)
     indices = np.zeros(n_source, dtype=np.int32)
+    distances = np.zeros(n_source, dtype=np.float32)
 
-    num_batches = (n_source + batch_size - 1) // batch_size
-    print(f"\n      → Processing {num_batches} batches on CPU...", flush=True)
+    for i in range(n_source):
+        diffs = target_points - source_points[i]
+        dists = np.sum(diffs ** 2, axis=1)
+        min_idx = np.argmin(dists)
+        indices[i] = min_idx
+        distances[i] = np.sqrt(dists[min_idx])
 
-    # Process in batches for memory efficiency
-    for batch_idx, i in enumerate(range(0, n_source, batch_size)):
-        if batch_idx % 5 == 0:  # Print every 5 batches
-            print(f"         Batch {batch_idx + 1}/{num_batches} ({100 * (batch_idx + 1) / num_batches:.1f}%)",
-                  flush=True)
-
-        batch_end = min(i + batch_size, n_source)
-        batch_source = source_points[i:batch_end]
-
-        # Vectorized distance computation using broadcasting
-        # Shape: (batch_size, 1, 3) - (1, n_target, 3) = (batch_size, n_target, 3)
-        diff = batch_source[:, np.newaxis, :] - target_points[np.newaxis, :, :]
-        batch_distances = np.sqrt(np.sum(diff ** 2, axis=2))  # Faster than linalg.norm
-
-        batch_min_distances = np.min(batch_distances, axis=1)
-        batch_min_indices = np.argmin(batch_distances, axis=1)
-
-        distances[i:batch_end] = batch_min_distances
-        indices[i:batch_end] = batch_min_indices
-
-    return distances, indices
+    return indices, distances
 
 
-def find_closest_points(source_points: np.ndarray,
-                        target_points: np.ndarray,
-                        use_gpu: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+def transform_points_cpu(points, transformation):
     """
-    Find the closest point in target for each point in source.
-    Automatically uses GPU if available and requested.
+    CPU fallback for transforming points
+    """
+    n_points = points.shape[0]
+    output = np.zeros_like(points)
 
-    Parameters:
-    -----------
-    source_points : np.ndarray
-        Source point cloud points (N x 3)
-    target_points : np.ndarray
-        Target point cloud points (M x 3)
-    use_gpu : bool
-        Whether to use GPU acceleration if available
+    for i in range(n_points):
+        x, y, z = points[i]
+        output[i, 0] = transformation[0, 0] * x + transformation[0, 1] * y + transformation[0, 2] * z + transformation[
+            0, 3]
+        output[i, 1] = transformation[1, 0] * x + transformation[1, 1] * y + transformation[1, 2] * z + transformation[
+            1, 3]
+        output[i, 2] = transformation[2, 0] * x + transformation[2, 1] * y + transformation[2, 2] * z + transformation[
+            2, 3]
+
+    return output
+
+
+def compute_transformation_svd(source_matched, target_matched):
+    """
+    Compute optimal transformation using SVD
+
+    Args:
+        source_matched: Nx3 array of matched source points
+        target_matched: Nx3 array of matched target points
 
     Returns:
-    --------
-    distances : np.ndarray
-        Distance to closest point for each source point
-    indices : np.ndarray
-        Index of closest target point for each source point
+        4x4 transformation matrix
     """
-    if use_gpu and CUDA_AVAILABLE:
-        return find_closest_points_gpu(source_points, target_points)
-    else:
-        return find_closest_points_cpu(source_points, target_points)
+    # Compute centroids
+    centroid_source = np.mean(source_matched, axis=0)
+    centroid_target = np.mean(target_matched, axis=0)
 
+    # Center the points
+    source_centered = source_matched - centroid_source
+    target_centered = target_matched - centroid_target
 
-def compute_transformation(source_points: np.ndarray,
-                           target_points: np.ndarray) -> np.ndarray:
-    """
-    Compute the optimal transformation (rotation + translation) that aligns
-    source points to target points using SVD.
-
-    This implements the solution to the Procrustes problem.
-
-    Parameters:
-    -----------
-    source_points : np.ndarray
-        Source point cloud points (N x 3)
-    target_points : np.ndarray
-        Corresponding target point cloud points (N x 3)
-
-    Returns:
-    --------
-    transformation : np.ndarray
-        4x4 homogeneous transformation matrix
-    """
-    # Step 1: Compute centroids
-    source_centroid = np.mean(source_points, axis=0)
-    target_centroid = np.mean(target_points, axis=0)
-
-    # Step 2: Center the point clouds
-    source_centered = source_points - source_centroid
-    target_centered = target_points - target_centroid
-
-    # Step 3: Compute the covariance matrix H
+    # Compute cross-covariance matrix
     H = source_centered.T @ target_centered
 
-    # Step 4: Compute SVD of H
+    # SVD
     U, S, Vt = np.linalg.svd(H)
 
-    # Step 5: Compute rotation matrix
+    # Compute rotation
     R = Vt.T @ U.T
 
-    # Handle reflection case (det(R) = -1)
+    # Handle reflection case
     if np.linalg.det(R) < 0:
         Vt[-1, :] *= -1
         R = Vt.T @ U.T
 
-    # Step 6: Compute translation vector
-    t = target_centroid - R @ source_centroid
+    # Compute translation
+    t = centroid_target - R @ centroid_source
 
-    # Step 7: Build 4x4 homogeneous transformation matrix
+    # Build 4x4 transformation matrix
     transformation = np.eye(4)
     transformation[:3, :3] = R
     transformation[:3, 3] = t
@@ -240,220 +160,175 @@ def compute_transformation(source_points: np.ndarray,
     return transformation
 
 
-def icp_registration(source: o3d.geometry.PointCloud,
-                     target: o3d.geometry.PointCloud,
-                     max_iterations: int = 50,
-                     tolerance: float = 1e-6,
-                     max_correspondence_distance: float = 0.05,
-                     use_gpu: bool = True) -> np.ndarray:
+def icp_cuda(source, target, max_iterations=50, tolerance=1e-6, use_cuda=None):
     """
-    Custom implementation of the Iterative Closest Point (ICP) algorithm.
-    GPU-accelerated when CuPy is available.
+    Iterative Closest Point algorithm with CUDA acceleration (if available)
 
-    Algorithm:
-    1. Find closest points between source and target (GPU-accelerated)
-    2. Compute optimal transformation using SVD
-    3. Apply transformation to source
-    4. Repeat until convergence
-
-    Parameters:
-    -----------
-    source : o3d.geometry.PointCloud
-        Source point cloud to be aligned
-    target : o3d.geometry.PointCloud
-        Target point cloud (reference)
-    max_iterations : int
-        Maximum number of ICP iterations
-    tolerance : float
-        Convergence threshold (change in mean squared error)
-    max_correspondence_distance : float
-        Maximum distance for a point pair to be considered a correspondence
-    use_gpu : bool
-        Whether to use GPU acceleration if available
+    Args:
+        source: Open3D point cloud (source)
+        target: Open3D point cloud (target)
+        max_iterations: Maximum number of ICP iterations
+        tolerance: Convergence tolerance
+        use_cuda: Force CUDA on/off (None for auto-detect)
 
     Returns:
-    --------
-    transformation : np.ndarray
-        Final 4x4 homogeneous transformation matrix
+        Final 4x4 transformation matrix
     """
+    # Determine whether to use CUDA
+    if use_cuda is None:
+        use_cuda = CUDA_AVAILABLE
+    elif use_cuda and not CUDA_AVAILABLE:
+        print("Warning: CUDA requested but not available. Using CPU.")
+        use_cuda = False
+
     # Convert to numpy arrays
-    source_points = np.asarray(source.points)
-    target_points = np.asarray(target.points)
+    source_points = np.asarray(source.points).astype(np.float32)
+    target_points = np.asarray(target.points).astype(np.float32)
 
-    # Initialize transformation as identity
-    current_transformation = np.eye(4)
+    n_source = source_points.shape[0]
+    n_target = target_points.shape[0]
 
-    # Make a copy of source points for iteration
+    # Initialize transformation
+    transformation = np.eye(4, dtype=np.float32)
+
+    # Current source points (will be updated each iteration)
     current_source = source_points.copy()
+
+    print(f"\nStarting ICP refinement {'with CUDA acceleration' if use_cuda else 'with CPU'}...")
+    print(f"Source points: {n_source}, Target points: {n_target}")
+
+    # CUDA-specific setup
+    if use_cuda:
+        try:
+            # CUDA configuration
+            threads_per_block = 256
+            blocks = (n_source + threads_per_block - 1) // threads_per_block
+
+            # Allocate device memory for target (stays on GPU)
+            d_target = cuda.to_device(target_points)
+            print(f"CUDA initialized: {blocks} blocks × {threads_per_block} threads")
+        except Exception as e:
+            print(f"Error initializing CUDA: {e}")
+            print("Falling back to CPU")
+            use_cuda = False
 
     prev_error = float('inf')
 
-    device_type = "GPU" if (use_gpu and CUDA_AVAILABLE) else "CPU"
-    print(f"\n{'=' * 70}")
-    print(f"Starting ICP iterations on {device_type}")
-    print(f"{'=' * 70}")
-    print(f"Source points: {len(source_points):,}")
-    print(f"Target points: {len(target_points):,}")
-
-    # Estimate time
-    if use_gpu and CUDA_AVAILABLE:
-        print("\n⚡ GPU mode enabled!")
-        print("   Note: First iteration will be slower (GPU warmup/JIT compilation)")
-        print("   Subsequent iterations will be much faster!")
-
-    print(f"\n{'=' * 70}")
-    import sys
-    sys.stdout.flush()
-
-    import time
-    start_time = time.time()
-
     for iteration in range(max_iterations):
-        iter_start = time.time()
+        # Find nearest neighbors
+        if use_cuda:
+            try:
+                # CUDA version
+                indices = np.zeros(n_source, dtype=np.int32)
+                distances = np.zeros(n_source, dtype=np.float32)
 
-        print(f"\n{'─' * 70}")
-        print(f"ITERATION {iteration + 1}/{max_iterations}")
-        print(f"{'─' * 70}")
+                d_current_source = cuda.to_device(current_source)
+                d_indices = cuda.to_device(indices)
+                d_distances = cuda.to_device(distances)
 
-        # Step 1: Find closest points (GPU-accelerated if available)
-        print(f"[1/4] Finding closest points...", end='', flush=True)
-        step_start = time.time()
-        distances, indices = find_closest_points(current_source, target_points, use_gpu=use_gpu)
-        print(f" ✓ Done ({time.time() - step_start:.2f}s)", flush=True)
+                find_nearest_neighbors_kernel[blocks, threads_per_block](
+                    d_current_source, d_target, d_indices, d_distances
+                )
 
-        print(f"[2/4] Filtering correspondences...", end='', flush=True)
-        step_start = time.time()
+                indices = d_indices.copy_to_host()
+                distances = d_distances.copy_to_host()
+            except Exception as e:
+                print(f"CUDA error during nearest neighbor search: {e}")
+                print("Falling back to CPU for this operation")
+                indices, distances = find_nearest_neighbors_cpu(current_source, target_points)
+        else:
+            # CPU version
+            indices, distances = find_nearest_neighbors_cpu(current_source, target_points)
 
-        print(f"[2/4] Filtering correspondences...", end='', flush=True)
-        step_start = time.time()
+        # Compute mean error
+        mean_error = np.mean(distances)
 
-        # Filter correspondences by maximum distance
-        valid_mask = distances < max_correspondence_distance
-        valid_source = current_source[valid_mask]
-        valid_target = target_points[indices[valid_mask]]
-
-        num_inliers = len(valid_source)
-        print(f" ✓ Done ({time.time() - step_start:.3f}s)", flush=True)
-        print(
-            f"      Inliers: {num_inliers:,}/{len(current_source):,} ({100 * num_inliers / len(current_source):.1f}%)")
-
-        if num_inliers < 3:
-            print(f"\n⚠ Only {num_inliers} valid correspondences found. Stopping.")
-            break
-
-        # Step 2: Compute mean squared error
-        print(f"[3/4] Computing error metrics...", end='', flush=True)
-        step_start = time.time()
-        mean_error = np.mean(distances[valid_mask] ** 2)
-        error_change = abs(prev_error - mean_error)
-        print(f" ✓ Done ({time.time() - step_start:.3f}s)", flush=True)
-        print(f"      Mean Error: {mean_error:.6e}")
-        print(f"      Error Change: {error_change:.6e}")
+        print(f"Iteration {iteration + 1:2d}: Mean error = {mean_error:.6f}")
 
         # Check convergence
-        if error_change < tolerance:
-            elapsed = time.time() - start_time
-            print(f"\n{'=' * 70}")
-            print(f"✓ CONVERGED at iteration {iteration + 1}")
-            print(f"  Total time: {elapsed:.2f}s")
-            print(f"  Average time per iteration: {elapsed / (iteration + 1):.2f}s")
-            print(f"{'=' * 70}")
+        if abs(prev_error - mean_error) < tolerance:
+            print(f"Converged at iteration {iteration + 1}")
             break
-
-        # Step 4: Compute transformation for this iteration
-        print(f"[4/4] Computing transformation...", end='', flush=True)
-        step_start = time.time()
-        iteration_transformation = compute_transformation(valid_source, valid_target)
-        print(f" ✓ Done ({time.time() - step_start:.3f}s)", flush=True)
-
-        # Step 5: Update cumulative transformation
-        current_transformation = iteration_transformation @ current_transformation
-
-        # Step 6: Apply transformation to source points
-        current_source = (iteration_transformation[:3, :3] @ source_points.T).T + \
-                         iteration_transformation[:3, 3]
 
         prev_error = mean_error
 
-        iter_time = time.time() - iter_start
-        print(f"\n⏱  Iteration completed in {iter_time:.2f}s")
+        # Get matched point pairs
+        source_matched = current_source
+        target_matched = target_points[indices]
 
-        # Estimate remaining time
-        if iteration > 0:
-            avg_time = (time.time() - start_time) / (iteration + 1)
-            est_remaining = avg_time * (max_iterations - iteration - 1)
-            print(f"📊 Estimated time remaining: {est_remaining:.1f}s")
+        # Compute transformation using SVD (CPU)
+        delta_transformation = compute_transformation_svd(source_matched, target_matched)
 
-    total_time = time.time() - start_time
+        # Update cumulative transformation
+        transformation = delta_transformation @ transformation
 
-    total_time = time.time() - start_time
+        # Transform source points
+        if use_cuda:
+            try:
+                # CUDA version
+                d_transformation = cuda.to_device(delta_transformation.astype(np.float32))
+                d_output = cuda.device_array((n_source, 3), dtype=np.float32)
 
-    print(f"\n{'=' * 70}")
-    print(f"ICP COMPLETED")
-    print(f"{'=' * 70}")
-    print(f"Total time: {total_time:.2f}s")
-    print(f"Final mean error: {mean_error:.6e}")
-    print(f"Final inliers: {num_inliers:,}/{len(source_points):,} ({100 * num_inliers / len(source_points):.1f}%)")
+                transform_points_kernel[blocks, threads_per_block](
+                    d_current_source, d_transformation, d_output
+                )
+
+                current_source = d_output.copy_to_host()
+            except Exception as e:
+                print(f"CUDA error during transformation: {e}")
+                print("Falling back to CPU for this operation")
+                current_source = transform_points_cpu(current_source, delta_transformation)
+        else:
+            # CPU version
+            current_source = transform_points_cpu(current_source, delta_transformation)
+
+    print(f"\nICP refinement completed!")
+    print(f"Final mean error: {mean_error:.6f}")
     print(f"\nFinal transformation matrix:")
-    print(current_transformation)
-    print(f"{'=' * 70}\n")
+    print(transformation)
 
-    return current_transformation
+    return transformation
 
 
 def draw_registration_result(source, target, transformation):
     """
-    Visualize the registration result.
+    Visualize the registration result
 
-    Parameters:
-    -----------
-    source : o3d.geometry.PointCloud
-        Source point cloud
-    target : o3d.geometry.PointCloud
-        Target point cloud
-    transformation : np.ndarray
-        4x4 homogeneous transformation matrix
+    Args:
+        source: Source point cloud
+        target: Target point cloud
+        transformation: 4x4 homogeneous transformation matrix
     """
     source_temp = copy.deepcopy(source)
     target_temp = copy.deepcopy(target)
-
-    # Color the point clouds
-    source_temp.paint_uniform_color([1, 0.706, 0])  # Orange for source
-    target_temp.paint_uniform_color([0, 0.651, 0.929])  # Blue for target
-
-    # Apply transformation to source
+    source_temp.paint_uniform_color([1, 0.706, 0])
+    target_temp.paint_uniform_color([0, 0.651, 0.929])
     source_temp.transform(transformation)
-
-    # Visualize
     o3d.visualization.draw_geometries([source_temp, target_temp],
                                       zoom=0.4459,
-                                      front=[0.9288, -0.2951, -0.2242],
+                                      front=[-0.9288, -0.2951, -0.2242],
                                       lookat=[1.6784, 2.0612, 1.4451],
                                       up=[-0.3402, -0.9189, -0.1996])
 
 
-# Demo usage
+# Main execution
 if __name__ == "__main__":
-    # Load demo ICP point clouds
+    # Load demo point clouds
     demo_icp_pcds = o3d.data.DemoICPPointClouds()
     source = o3d.io.read_point_cloud(demo_icp_pcds.paths[0])
     target = o3d.io.read_point_cloud(demo_icp_pcds.paths[1])
 
-    print("=" * 55)
+    print("=" * 60)
     print("ICP Point Cloud Registration")
-    print("=" * 55)
-    print("\nSource point cloud:")
-    print(source)
-    print("\nTarget point cloud:")
-    print(target)
+    print("=" * 60)
+    print(f"Source: {len(source.points)} points")
+    print(f"Target: {len(target.points)} points")
 
-    # Apply custom ICP with GPU acceleration
-    transformation = icp_registration(source, target,
-                                      max_iterations=50,
-                                      tolerance=1e-6,
-                                      max_correspondence_distance=0.05,
-                                      use_gpu=True)  # Set to False to force CPU
+    # Perform ICP (will auto-detect CUDA or use CPU)
+    transformation = icp_cuda(source, target, max_iterations=50, tolerance=1e-6)
 
-    # Visualize the result
-    print("\nLaunching visualization...")
+    print("\n" + "=" * 60)
+    print("Visualizing registration result...")
+
+    # Visualize result
     draw_registration_result(source, target, transformation)

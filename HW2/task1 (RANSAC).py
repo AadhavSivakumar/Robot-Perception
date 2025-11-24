@@ -140,7 +140,7 @@ if __name__ == "__main__":
     # Apply custom RANSAC
     plane, inliers = ransac_plane_fitting(pcd,
                                           distance_threshold=0.02,
-                                          num_iterations=500,
+                                          num_iterations=1000,
                                           num_samples=3)
 
     # Visualize results
