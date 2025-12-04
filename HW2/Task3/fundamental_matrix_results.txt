@@ -1,0 +1,60 @@
+======================================================================
+TASK 3: F-MATRIX AND RELATIVE POSE ESTIMATION RESULTS
+======================================================================
+
+PART A: FUNDAMENTAL MATRIX ESTIMATION
+----------------------------------------------------------------------
+Total keypoints in image 1: 52958
+Total keypoints in image 2: 43307
+Good matches after ratio test: 623
+Inlier matches after RANSAC: 464
+
+Estimated Fundamental Matrix F:
+[[ 4.13059060e-09  4.29625912e-08 -9.81003260e-05]
+ [ 8.23583662e-08  1.20512046e-08  8.41036342e-04]
+ [-2.70485965e-04 -1.17557346e-03  1.00000000e+00]]
+
+
+PART C: RELATIVE POSE ANALYSIS
+----------------------------------------------------------------------
+
+Question 1: Can you directly use F-matrix to acquire R and t?
+Answer: NO
+
+Explanation: The Fundamental matrix F contains only projective geometry
+information. To recover metric information (R and t), we need the camera
+intrinsic parameters K.
+
+Question 2: What other quantity/matrix do you need?
+Answer: Camera Intrinsic Matrix K
+
+Process:
+1. Obtain or estimate K (contains focal length and principal point)
+2. Compute Essential matrix: E = K^T * F * K
+3. Decompose E to get R and t
+
+Assumed Camera Intrinsic Matrix K:
+[[5.712e+03 0.000e+00 2.142e+03]
+ [0.000e+00 5.712e+03 2.856e+03]
+ [0.000e+00 0.000e+00 1.000e+00]]
+
+Essential Matrix E:
+[[ 0.13476855  1.40173806  0.19105817]
+ [ 2.6871018   0.39319398  6.00825975]
+ [-0.15092673 -5.99262684  0.13895795]]
+
+Recovered Rotation Matrix R:
+[[ 0.79782056 -0.00353448 -0.60288461]
+ [-0.01637638  0.99948679 -0.02753111]
+ [ 0.60267252  0.03183795  0.79735324]]
+
+Rotation angle: 37.12 degrees
+
+Recovered Translation t (up to scale):
+[ 0.97360324 -0.036172    0.22536262]
+Normalized direction: [ 0.97360324 -0.036172    0.22536262]
+
+INTERPRETATION:
+The camera underwent a 37.12° rotation between the two images.
+The translation was primarily lateral (sideways movement).
+This is consistent with the visual appearance of the two robot images.
